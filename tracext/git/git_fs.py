@@ -12,8 +12,6 @@
 # individuals. For the exact contribution history, see the revision
 # history and logs, available at http://trac.edgewall.org/log/.
 
-from __future__ import with_statement
-
 from datetime import datetime
 import os
 import sys
@@ -443,29 +441,38 @@ class GitRepository(Repository):
         if old_path != new_path:
             raise TracError("not supported in git_fs")
 
-        with self.git.get_historian(old_rev,
-                                    old_path.strip('/')) as old_historian:
-            with self.git.get_historian(new_rev,
-                                        new_path.strip('/')) as new_historian:
-                for chg in self.git.diff_tree(old_rev, new_rev,
-                                              self.normalize_path(new_path)):
-                    mode1, mode2, obj1, obj2, action, path, path2 = chg
+        def iter_changes():
+            for chg in self.git.diff_tree(old_rev, new_rev,
+                                          self.normalize_path(new_path)):
+                mode1, mode2, obj1, obj2, action, path, path2 = chg
 
-                    kind = Node.FILE
-                    if mode2.startswith('04') or mode1.startswith('04'):
-                        kind = Node.DIRECTORY
+                kind = Node.FILE
+                if mode2.startswith('04') or mode1.startswith('04'):
+                    kind = Node.DIRECTORY
 
-                    change = GitChangeset.action_map[action]
+                change = GitChangeset.action_map[action]
 
-                    old_node = None
-                    new_node = None
+                old_node = None
+                new_node = None
 
-                    if change != Changeset.ADD:
-                        old_node = self.get_node(path, old_rev, old_historian)
-                    if change != Changeset.DELETE:
-                        new_node = self.get_node(path, new_rev, new_historian)
+                if change != Changeset.ADD:
+                    old_node = self.get_node(path, old_rev, old_historian)
+                if change != Changeset.DELETE:
+                    new_node = self.get_node(path, new_rev, new_historian)
 
-                    yield old_node, new_node, kind, change
+                yield old_node, new_node, kind, change
+
+        old_historian = self.git.get_historian(old_rev, old_path.strip('/'))
+        try:
+            new_historian = self.git.get_historian(new_rev, new_path.strip('/'))
+            try:
+                changes = list(iter_changes())
+            finally:
+                new_historian.close()
+        finally:
+            old_historian.close()
+
+        return iter(changes)
 
     def next_rev(self, rev, path=''):
         return self.git.hist_next_revision(rev)
@@ -580,11 +587,17 @@ class GitNode(Node):
         if not self.isdir:
             return
 
-        with self.repos.git.get_historian(self.rev,
-                                          self.path.strip('/')) as historian:
-            for ent in self.repos.git.ls_tree(self.rev, self.__git_path()):
-                yield GitNode(self.repos, ent[-1], self.rev, self.log, ent,
-                              historian)
+        historian = self.repos.git.get_historian(self.rev,
+                                                 self.path.strip('/'))
+        try:
+            nodes = [GitNode(self.repos, ent[-1], self.rev, self.log, ent,
+                             historian)
+                     for ent in self.repos.git.ls_tree(self.rev,
+                                                       self.__git_path())]
+        finally:
+            historian.close()
+
+        return iter(nodes)
 
     def get_content_type(self):
         if self.isdir:
@@ -605,8 +618,11 @@ class GitNode(Node):
         # TODO: find a way to follow renames/copies
         for is_last, rev in _last_iterable(self.repos.git.history(self.rev,
                                                 self.__git_path(), limit)):
-            yield (self.path, rev, Changeset.EDIT if not is_last else
-                                   Changeset.ADD)
+            if is_last:
+                action = Changeset.ADD
+            else:
+                action = Changeset.EDIT
+            yield self.path, rev, action
 
     def get_last_modified(self):
         if not self.isfile:

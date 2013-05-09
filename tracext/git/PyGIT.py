@@ -12,14 +12,10 @@
 # individuals. For the exact contribution history, see the revision
 # history and logs, available at http://trac.edgewall.org/log/.
 
-from __future__ import with_statement
-
 import os
 import codecs
 from collections import deque
-from contextlib import contextmanager
 import cStringIO
-from functools import partial
 from operator import itemgetter
 import re
 from subprocess import Popen, PIPE
@@ -27,6 +23,8 @@ import sys
 from threading import Lock
 import time
 import weakref
+
+from trac.util.compat import all, any, partial
 
 
 __all__ = ['GitError', 'GitErrorSha', 'Storage', 'StorageFactory']
@@ -63,6 +61,72 @@ def terminate(process):
     if sys.platform == 'win32':
         return terminate_win(process)
     return terminate_nix(process)
+
+
+class Historian(object):
+
+    def __init__(self, storage, sha, base_path):
+        self.storage = storage
+        self.log = storage.logger
+        self.pipe = None
+        self.change = {}
+        self.next_path = None
+        self.sha = sha
+        self.base_path = storage._fs_from_unicode(base_path)
+        self.gen = self.name_status_gen(sha, self.base_path)
+
+    def create_pipe(self, sha, base_path):
+        return self.storage.repo.log_pipe('--pretty=format:%n%H',
+                                          '--name-status', sha, '--',
+                                          base_path)
+
+    def name_status_gen(self, sha, base_path):
+        self.pipe = self.create_pipe(sha, base_path)
+        f = self.pipe.stdout
+        for l in f:
+            if l == '\n':
+                continue
+            old_sha = l.rstrip('\n')
+            for l in f:
+                if l == '\n':
+                    break
+                _, path = l.rstrip('\n').split('\t', 1)
+                while path not in self.change:
+                    self.change[path] = old_sha
+                    if self.next_path == path:
+                        yield old_sha
+                    try:
+                        path, _ = path.rsplit('/', 1)
+                    except ValueError:
+                        break
+        self.close()
+        while True:
+            yield None
+
+    def close(self):
+        pipe = self.pipe
+        if pipe:
+            pipe.stdout.close()
+            terminate(pipe)
+            pipe.wait()
+            self.pipe = None
+
+    def __call__(self, path):
+        path = self.storage._fs_from_unicode(path)
+        try:
+            return self.change[path]
+        except KeyError:
+            self.next_path = path
+            return self.gen.next()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, et, ev, tb):
+        self.close()
+
+    def __del__(self):
+        self.close()
 
 
 class GitError(Exception):
@@ -179,7 +243,8 @@ class SizedDict(dict):
         self.__lock = Lock()
 
     def __setitem__(self, name, value):
-        with self.__lock:
+        self.__lock.acquire()
+        try:
             assert len(self) == len(self.__key_fifo) # invariant
 
             if not self.__contains__(name):
@@ -194,6 +259,9 @@ class SizedDict(dict):
 
             return rc
 
+        finally:
+            self.__lock.release()
+
     def setdefault(self, *_):
         raise NotImplemented("SizedDict has no setdefault() method")
 
@@ -207,7 +275,8 @@ class StorageFactory(object):
                  git_fs_encoding=None):
         self.logger = log
 
-        with StorageFactory.__dict_lock:
+        StorageFactory.__dict_lock.acquire()
+        try:
             try:
                 i = StorageFactory.__dict[repo]
             except KeyError:
@@ -223,6 +292,8 @@ class StorageFactory(object):
                         pass
                 else:
                     StorageFactory.__dict_nonweak[repo] = i
+        finally:
+            StorageFactory.__dict_lock.release()
 
         self.__inst = i
         self.__repo = repo
@@ -406,11 +477,14 @@ class Storage(object):
         self.logger.debug("PyGIT.Storage instance %d constructed" % id(self))
 
     def __del__(self):
-        with self.__cat_file_pipe_lock:
+        self.__cat_file_pipe_lock.acquire()
+        try:
             if self.__cat_file_pipe is not None:
                 self.__cat_file_pipe.stdin.close()
                 terminate(self.__cat_file_pipe)
                 self.__cat_file_pipe.wait()
+        finally:
+            self.__cat_file_pipe_lock.release()
 
     #
     # cache handling
@@ -420,7 +494,8 @@ class Storage(object):
     def __rev_cache_sync(self, youngest_rev=None):
         """invalidates revision db cache if necessary"""
 
-        with self.__rev_cache_lock:
+        self.__rev_cache_lock.acquire()
+        try:
             need_update = False
             if self.__rev_cache:
                 last_youngest_rev = self.__rev_cache.youngest_rev
@@ -436,6 +511,9 @@ class Storage(object):
 
             return need_update
 
+        finally:
+            self.__rev_cache_lock.release()
+
     def get_rev_cache(self):
         """Retrieve revision cache
 
@@ -444,7 +522,8 @@ class Storage(object):
         returns RevCache tuple
         """
 
-        with self.__rev_cache_lock:
+        self.__rev_cache_lock.acquire()
+        try:
             if self.__rev_cache is None:
                 # can be cleared by Storage.__rev_cache_sync()
                 self.logger.debug("triggered rebuild of commit tree db "
@@ -505,7 +584,9 @@ class Storage(object):
 
                     else: # new entry
                         _children = []
-                        _rheads = [rev] if rev in head_revs else []
+                        _rheads = []
+                        if rev in head_revs:
+                            _rheads.append(rev)
 
                     # create/update entry
                     # transform lists into tuples since entry will be final
@@ -535,8 +616,10 @@ class Storage(object):
                 __rev_seen = None
 
                 # convert sdb either to dict or array depending on size
-                tmp = [()]*(max(new_sdb.keys())+1) \
-                      if len(new_sdb) > 5000 else {}
+                if len(new_sdb) > 5000:
+                    tmp = [()] * (max(new_sdb.keys()) + 1)
+                else:
+                    tmp = {}
 
                 try:
                     while True:
@@ -561,7 +644,9 @@ class Storage(object):
                    or not any(self.__rev_cache)
 
             return self.__rev_cache
-        # with self.__rev_cache_lock
+
+        finally:
+            self.__rev_cache_lock.release()
 
     # see RevCache namedtuple
     rev_cache = property(get_rev_cache)
@@ -661,7 +746,8 @@ class Storage(object):
         return self.verifyrev('HEAD')
 
     def cat_file(self, kind, sha):
-        with self.__cat_file_pipe_lock:
+        self.__cat_file_pipe_lock.acquire()
+        try:
             if self.__cat_file_pipe is None:
                 self.__cat_file_pipe = self.repo.cat_file_batch()
 
@@ -693,6 +779,9 @@ class Storage(object):
                 terminate(self.__cat_file_pipe)
                 self.__cat_file_pipe.wait()
                 self.__cat_file_pipe = None
+
+        finally:
+            self.__cat_file_pipe_lock.release()
 
     def verifyrev(self, rev):
         """verify/lookup given revision object and return a sha id or None
@@ -822,7 +911,8 @@ class Storage(object):
                              (commit_id, commit_id_orig))
             raise GitErrorSha
 
-        with self.__commit_msg_lock:
+        self.__commit_msg_lock.acquire()
+        try:
             if self.__commit_msg_cache.has_key(commit_id):
                 # cache hit
                 result = self.__commit_msg_cache[commit_id]
@@ -836,6 +926,9 @@ class Storage(object):
             self.__commit_msg_cache[commit_id] = result
 
             return result[0], dict(result[1])
+
+        finally:
+            self.__commit_msg_lock.release()
 
     def get_file(self, sha):
         return cStringIO.StringIO(self.cat_file('blob', str(sha)))
@@ -897,54 +990,8 @@ class Storage(object):
                        .strip()
         return self.__rev_cache_sync(rev)
 
-    @contextmanager
     def get_historian(self, sha, base_path):
-        p = []
-        change = {}
-        next_path = []
-        base_path = self._fs_from_unicode(base_path)
-
-        def name_status_gen():
-            p[:] = [self.repo.log_pipe('--pretty=format:%n%H',
-                                       '--name-status', sha, '--', base_path)]
-            f = p[0].stdout
-            for l in f:
-                if l == '\n':
-                    continue
-                old_sha = l.rstrip('\n')
-                for l in f:
-                    if l == '\n':
-                        break
-                    _, path = l.rstrip('\n').split('\t', 1)
-                    while path not in change:
-                        change[path] = old_sha
-                        if next_path == [path]:
-                            yield old_sha
-                        try:
-                            path, _ = path.rsplit('/', 1)
-                        except ValueError:
-                            break
-            f.close()
-            terminate(p[0])
-            p[0].wait()
-            p[:] = []
-            while True:
-                yield None
-        gen = name_status_gen()
-
-        def historian(path):
-            path = self._fs_from_unicode(path)
-            try:
-                return change[path]
-            except KeyError:
-                next_path[:] = [path]
-                return gen.next()
-        yield historian
-
-        if p:
-            p[0].stdout.close()
-            terminate(p[0])
-            p[0].wait()
+        return Historian(self, sha, base_path)
 
     def last_change(self, sha, path, historian=None):
         if historian is not None:
@@ -1014,7 +1061,7 @@ class Storage(object):
         diff_tree_args = ['-z', '-r']
         if find_renames:
             diff_tree_args.append('-M')
-        diff_tree_args.extend([str(tree1) if tree1 else '--root',
+        diff_tree_args.extend([not tree1 and '--root' or str(tree1),
                                str(tree2),
                                '--', path])
 
