@@ -3,13 +3,15 @@
 from setuptools import setup
 
 setup(name='TracGit',
-      install_requires='Trac >= 0.12',
+      install_requires='Trac >= 0.12,<1.0',
       description='GIT version control plugin for Trac 0.12',
       author='Herbert Valerio Riedel',
       author_email='hvr@gnu.org',
+      maintainer='Jun Omae',
+      maintainer_email='jun66j5@gmail.com',
       keywords='trac scm plugin git',
       url="http://trac-hacks.org/wiki/GitPlugin",
-      version='0.12.0.5',
+      version='0.12.0.6',
       license="BSD",
       long_description="""
       This Trac 0.12 plugin provides support for the GIT SCM.
