@@ -102,6 +102,22 @@ def parse_commit(raw):
     return '\n'.join(lines), props
 
 
+_unquote_re = re.compile(r'\\(?:[abtnvfr"\\]|[0-7]{3})')
+_unquote_chars = {'a': '\a', 'b': '\b', 't': '\t', 'n': '\n', 'v': '\v',
+                  'f': '\f', 'r': '\r', '"': '"', '\\': '\\'}
+
+
+def _unquote(path):
+    if path.startswith('"') and path.endswith('"'):
+        def replace(match):
+            s = match.group(0)[1:]
+            if len(s) == 3:
+                return chr(int(s, 8))  # \ooo
+            return _unquote_chars[s]
+        path = _unquote_re.sub(replace, path[1:-1])
+    return path
+
+
 class GitCore(object):
     """Low-level wrapper around git executable"""
 
@@ -119,8 +135,7 @@ class GitCore(object):
 
         cmd = [self.__git_bin]
         if self.__git_dir:
-            cmd.extend(('--git-dir=%s' % self.__git_dir,
-                        '-c', 'core.quotepath=false'))
+            cmd.append('--git-dir=%s' % self.__git_dir)
         cmd.append(gitcmd)
         cmd.extend(args)
 
@@ -929,6 +944,8 @@ class Storage(object):
                     if l == '\n':
                         break
                     _, path = l.rstrip('\n').split('\t', 1)
+                    # git-log without -z option quotes each pathname
+                    path = _unquote(path)
                     while path not in change:
                         change[path] = old_sha
                         if next_path == [path]:
