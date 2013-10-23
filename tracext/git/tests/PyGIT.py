@@ -19,13 +19,13 @@ import tempfile
 import unittest
 from subprocess import Popen, PIPE
 
+import tracext.git.tests.compat
 from trac.test import locate, EnvironmentStub
-from trac.tests import compat
 from trac.util import create_file
 from trac.util.compat import close_fds
 from trac.versioncontrol.api import Changeset, DbRepositoryProvider
-from tracopt.versioncontrol.git.git_fs import GitConnector
-from tracopt.versioncontrol.git.PyGIT import GitCore, Storage, parse_commit
+from tracext.git.git_fs import GitConnector
+from tracext.git.PyGIT import GitCore, Storage, parse_commit
 
 
 def rmtree(path):
@@ -171,7 +171,7 @@ prettier.  I'll tell Ted to use nicer tag names for future cases.""", msg)
 class NormalTestCase(unittest.TestCase):
 
     def setUp(self):
-        self.env = EnvironmentStub()
+        self.env = EnvironmentStub(enable=('trac.*','tracext.git.*'))
         self.repos_path = tempfile.mkdtemp(prefix='trac-gitrepos-')
         self.git_bin = locate('git')
         # create git repository and master branch
@@ -270,7 +270,7 @@ class NormalTestCase(unittest.TestCase):
 class UnicodeNameTestCase(unittest.TestCase):
 
     def setUp(self):
-        self.env = EnvironmentStub()
+        self.env = EnvironmentStub(enable=('trac.*','tracext.git.*'))
         self.repos_path = tempfile.mkdtemp(prefix='trac-gitrepos-')
         self.git_bin = locate('git')
         # create git repository and master branch

@@ -13,7 +13,7 @@
 
 import unittest
 
-from tracopt.versioncontrol.git.tests import PyGIT
+from tracext.git.tests import PyGIT
 
 
 def suite():

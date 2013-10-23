@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from setuptools import setup
+from setuptools import setup, find_packages
 
 setup(name='TracGit',
       install_requires='Trac >= 0.12,<1.0',
@@ -18,7 +18,8 @@ setup(name='TracGit',
 
       See http://trac-hacks.org/wiki/GitPlugin for more details.
       """,
-      packages=['tracext', 'tracext.git'],
+      packages=find_packages(exclude=['*.tests']),
+      test_suite = 'tracext.git.tests.suite',
       namespace_packages=['tracext'],
       entry_points = {'trac.plugins': 'git = tracext.git.git_fs'},
       package_data={'': ['COPYING','README']}
