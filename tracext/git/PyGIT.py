@@ -91,6 +91,8 @@ class Historian(object):
                 if l == '\n':
                     break
                 _, path = l.rstrip('\n').split('\t', 1)
+                # git-log without -z option quotes each pathname
+                path = _unquote(path)
                 while path not in self.change:
                     self.change[path] = old_sha
                     if self.next_path == path:
@@ -166,6 +168,22 @@ def parse_commit(raw):
     return '\n'.join(lines), props
 
 
+_unquote_re = re.compile(r'\\(?:[abtnvfr"\\]|[0-7]{3})')
+_unquote_chars = {'a': '\a', 'b': '\b', 't': '\t', 'n': '\n', 'v': '\v',
+                  'f': '\f', 'r': '\r', '"': '"', '\\': '\\'}
+
+
+def _unquote(path):
+    if path.startswith('"') and path.endswith('"'):
+        def replace(match):
+            s = match.group(0)[1:]
+            if len(s) == 3:
+                return chr(int(s, 8))  # \ooo
+            return _unquote_chars[s]
+        path = _unquote_re.sub(replace, path[1:-1])
+    return path
+
+
 class GitCore(object):
     """Low-level wrapper around git executable"""
 
@@ -183,8 +201,7 @@ class GitCore(object):
 
         cmd = [self.__git_bin]
         if self.__git_dir:
-            cmd.extend(('--git-dir=%s' % self.__git_dir,
-                        '-c', 'core.quotepath=false'))
+            cmd.append('--git-dir=%s' % self.__git_dir)
         cmd.append(gitcmd)
         cmd.extend(args)
 
@@ -926,7 +943,7 @@ class Storage(object):
 
         self.__commit_msg_lock.acquire()
         try:
-            if self.__commit_msg_cache.has_key(commit_id):
+            if commit_id in self.__commit_msg_cache:
                 # cache hit
                 result = self.__commit_msg_cache[commit_id]
                 return result[0], dict(result[1])
@@ -1009,18 +1026,21 @@ class Storage(object):
     def last_change(self, sha, path, historian=None):
         if historian is not None:
             return historian(path)
-        return self.repo.rev_list('--max-count=1',
-                                  sha, '--',
-                                  self._fs_from_unicode(path)).strip() or None
+        tmp = self.history(sha, path, limit=1)
+        if tmp:
+            return tmp[0]
+        else:
+            return None
 
     def history(self, sha, path, limit=None):
         if limit is None:
             limit = -1
 
-        tmp = self.repo.rev_list('--max-count=%d' % limit, str(sha), '--',
-                                 self._fs_from_unicode(path))
-
-        return [ rev.strip() for rev in tmp.splitlines() ]
+        args = ['--max-count=%d' % limit, str(sha)]
+        if path:
+            args.extend(('--', self._fs_from_unicode(path)))
+        tmp = self.repo.rev_list(*args)
+        return [rev.strip() for rev in tmp.splitlines()]
 
     def history_timerange(self, start, stop):
         return [ rev.strip() for rev in \
