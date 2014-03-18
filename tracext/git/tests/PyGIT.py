@@ -23,7 +23,8 @@ from trac.util import create_file
 from trac.util.compat import close_fds
 from trac.versioncontrol.api import Changeset, DbRepositoryProvider
 from tracext.git.git_fs import GitConnector
-from tracext.git.PyGIT import GitCore, Storage, parse_commit
+from tracext.git.PyGIT import GitCore, GitError, Storage, StorageFactory, \
+                              parse_commit
 
 
 def rmtree(path):
@@ -197,9 +198,27 @@ class NormalTestCase(unittest.TestCase):
                                                             stdout, stderr))
         return proc
 
-    def _storage(self):
-        path = os.path.join(self.repos_path, '.git')
+    def _factory(self, weak, path=None):
+        if path is None:
+            path = os.path.join(self.repos_path, '.git')
+        return StorageFactory(path, self.env.log, weak)
+
+    def _storage(self, path=None):
+        if path is None:
+            path = os.path.join(self.repos_path, '.git')
         return Storage(path, self.env.log, self.git_bin, 'utf-8')
+
+    def test_control_files_detection(self):
+        # Exception not raised when path points to ctrl file dir
+        self.assertIsInstance(self._storage().repo, GitCore)
+        # Exception not raised when path points to parent of ctrl files dir
+        self.assertIsInstance(self._storage(self.repos_path).repo, GitCore)
+        # Exception raised when path points to dir with no ctrl files
+        path = tempfile.mkdtemp(dir=self.repos_path)
+        self.assertRaises(GitError, self._storage, path)
+        # Exception raised if a ctrl file is missing
+        os.remove(os.path.join(self.repos_path, '.git', 'HEAD'))
+        self.assertRaises(GitError, self._storage, self.repos_path)
 
     def test_get_branches_with_cr_in_commitlog(self):
         # regression test for #11598
@@ -263,6 +282,37 @@ class NormalTestCase(unittest.TestCase):
         self.assertEqual(parent_rev, history[1][1])
         self.assertEqual(Changeset.ADD, history[1][2])
         self.assertEqual(2, len(history))
+
+    def test_sync_after_removing_branch(self):
+        self._git('checkout', '-b', 'b1', 'master')
+        self._git('checkout', 'master')
+        create_file(os.path.join(self.repos_path, 'newfile.txt'))
+        self._git('add', 'newfile.txt')
+        self._git('commit', '-m', 'added newfile.txt to master',
+                  '--date', 'Mon Dec 23 15:52:23 2013 +0900')
+
+        storage = self._storage()
+        storage.sync()
+        self.assertEqual(['b1', 'master'],
+                         sorted(b[0] for b in storage.get_branches()))
+        self._git('branch', '-D', 'b1')
+        self.assertEqual(True, storage.sync())
+        self.assertEqual(['master'],
+                         sorted(b[0] for b in storage.get_branches()))
+        self.assertEqual(False, storage.sync())
+
+    def test_turn_off_persistent_cache(self):
+        # persistent_cache is enabled
+        parent_rev = self._factory(False).getInstance().youngest_rev()
+
+        create_file(os.path.join(self.repos_path, 'newfile.txt'))
+        self._git('add', 'newfile.txt')
+        self._git('commit', '-m', 'test_turn_off_persistent_cache',
+                  '--date', 'Wed, 29 Jan 2014 22:13:25 +0900')
+
+        # persistent_cache is disabled
+        rev = self._factory(True).getInstance().youngest_rev()
+        self.assertNotEqual(rev, parent_rev)
 
 
 class UnicodeNameTestCase(unittest.TestCase):
@@ -548,12 +598,12 @@ def suite():
     suite = unittest.TestSuite()
     git = locate("git")
     if git:
-        suite.addTest(unittest.makeSuite(GitTestCase, 'test'))
-        suite.addTest(unittest.makeSuite(TestParseCommit, 'test'))
-        suite.addTest(unittest.makeSuite(NormalTestCase, 'test'))
+        suite.addTest(unittest.makeSuite(GitTestCase))
+        suite.addTest(unittest.makeSuite(TestParseCommit))
+        suite.addTest(unittest.makeSuite(NormalTestCase))
         if os.name != 'nt':
             # Popen doesn't accept unicode path and arguments on Windows
-            suite.addTest(unittest.makeSuite(UnicodeNameTestCase, 'test'))
+            suite.addTest(unittest.makeSuite(UnicodeNameTestCase))
     else:
         print("SKIP: tracopt/versioncontrol/git/tests/PyGIT.py (git cli "
               "binary, 'git', not found)")

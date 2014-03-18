@@ -13,14 +13,17 @@
 # history and logs, available at http://trac.edgewall.org/log/.
 
 from datetime import datetime
+import itertools
 import os
 import sys
 
 from genshi.builder import tag
 
+from trac.cache import cached
 from trac.config import BoolOption, IntOption, PathOption, Option
 from trac.core import *
 from trac.util import TracError, shorten_line
+from trac.util.compat import any
 from trac.util.datefmt import FixedOffset, to_timestamp, format_datetime
 from trac.util.text import to_unicode, exception_to_unicode
 from trac.versioncontrol.api import Changeset, Node, Repository, \
@@ -53,6 +56,22 @@ class GitCachedRepository(CachedRepository):
         if normrev is None:
             raise NoSuchChangeset(rev)
         return normrev
+
+    def get_changesets(self, start, stop):
+        for key, csets in itertools.groupby(
+                CachedRepository.get_changesets(self, start, stop),
+                key=lambda cset: cset.date):
+            csets = list(csets)
+            if len(csets) == 1:
+                yield csets[0]
+                continue
+            rev_csets = dict((cset.rev, cset) for cset in csets)
+            while rev_csets:
+                revs = [rev for rev in rev_csets
+                            if not any(r in rev_csets
+                                       for r in self.repos.child_revs(rev))]
+                for rev in sorted(revs):
+                    yield rev_csets.pop(rev)
 
     def get_changeset(self, rev):
         return GitCachedChangeset(self, self.normalize_rev(rev), self.env)
@@ -248,7 +267,7 @@ class GitConnector(Component):
             def rlookup_uid(_):
                 return None
 
-        repos = GitRepository(dir, params, self.log,
+        repos = GitRepository(self.env, dir, params, self.log,
                               persistent_cache=self.persistent_cache,
                               git_bin=self.git_bin,
                               git_fs_encoding=self.git_fs_encoding,
@@ -355,7 +374,7 @@ class CsetPropertyRenderer(Component):
 class GitRepository(Repository):
     """Git repository"""
 
-    def __init__(self, path, params, log,
+    def __init__(self, env, path, params, log,
                  persistent_cache=False,
                  git_bin='git',
                  git_fs_encoding='utf-8',
@@ -365,9 +384,11 @@ class GitRepository(Repository):
                  use_committer_time=False,
                  ):
 
+        self.env = env
         self.logger = log
         self.gitrepo = path
         self.params = params
+        self.persistent_cache = persistent_cache
         self.shortrev_len = max(4, min(shortrev_len, 40))
         self.rlookup_uid = rlookup_uid
         self.use_committer_time = use_committer_time
@@ -384,14 +405,25 @@ class GitRepository(Repository):
                             "repository." % path)
 
         Repository.__init__(self, 'git:'+path, self.params, log)
+        self._rev_cache_id = str(self.id)
 
     def close(self):
         self.git = None
 
+    @cached('_rev_cache_id')
+    def _rev_cache(self, db):
+        self.git.invalidate_rev_cache()
+
+    def _check_rev_cache(self):
+        if self.persistent_cache:
+            self._rev_cache
+
     def get_youngest_rev(self):
+        self._check_rev_cache()
         return self.git.youngest_rev()
 
     def get_oldest_rev(self):
+        self._check_rev_cache()
         return self.git.oldest_rev()
 
     def normalize_path(self, path):
@@ -416,6 +448,7 @@ class GitRepository(Repository):
         return GitNode(self, path, rev, self.log, None, historian)
 
     def get_quickjump_entries(self, rev):
+        self._check_rev_cache()
         for bname, bsha in self.git.get_branches():
             yield 'branches', bname, '/', bsha
         for t in self.git.get_tags():
@@ -504,6 +537,8 @@ class GitRepository(Repository):
         if rev_callback:
             revs = set(self.git.all_revs())
 
+        if self.persistent_cache:
+            del self._rev_cache  # invalidate persistent cache
         if not self.git.sync():
             return None # nothing expected to change
 

@@ -25,6 +25,7 @@ import time
 import weakref
 
 from trac.util.compat import all, any, partial
+from trac.util.text import to_unicode
 
 
 __all__ = ['GitError', 'GitErrorSha', 'Storage', 'StorageFactory']
@@ -299,21 +300,24 @@ class StorageFactory(object):
 
         StorageFactory.__dict_lock.acquire()
         try:
+            if weak:
+                # remove additional reference which is created
+                # with non-weak argument
+                try:
+                    del StorageFactory.__dict_nonweak[repo]
+                except KeyError:
+                    pass
+
             try:
                 i = StorageFactory.__dict[repo]
             except KeyError:
                 i = Storage(repo, log, git_bin, git_fs_encoding)
                 StorageFactory.__dict[repo] = i
 
-                # create or remove additional reference depending on 'weak'
-                # argument
-                if weak:
-                    try:
-                        del StorageFactory.__dict_nonweak[repo]
-                    except KeyError:
-                        pass
-                else:
-                    StorageFactory.__dict_nonweak[repo] = i
+            # create additional reference depending on 'weak' argument
+            if not weak:
+                StorageFactory.__dict_nonweak[repo] = i
+
         finally:
             StorageFactory.__dict_lock.release()
 
@@ -483,16 +487,19 @@ class Storage(object):
 
         # simple sanity checking
         __git_file_path = partial(os.path.join, git_dir)
-        if not all(map(os.path.exists,
-                       map(__git_file_path,
-                           ['HEAD','objects','refs']))):
-            self.logger.error("GIT control files missing in '%s'" % git_dir)
-            if os.path.exists(__git_file_path('.git')):
-                self.logger.error("entry '.git' found in '%s'"
-                                  " -- maybe use that folder instead..."
+        control_files = ['HEAD', 'objects', 'refs']
+        control_files_exist = \
+            lambda p: all(map(os.path.exists, map(p, control_files)))
+        if not control_files_exist(__git_file_path):
+            __git_file_path = partial(os.path.join, git_dir, '.git')
+            if os.path.exists(__git_file_path()) and \
+                    control_files_exist(__git_file_path):
+                git_dir = __git_file_path()
+            else:
+                self.logger.error("GIT control files missing in '%s'"
                                   % git_dir)
-            raise GitError("GIT control files not found, maybe wrong "
-                           "directory?")
+                raise GitError("GIT control files not found, maybe wrong "
+                               "directory?")
         # at least, check that the HEAD file is readable
         head_file = os.path.join(git_dir, 'HEAD')
         try:
@@ -500,7 +507,7 @@ class Storage(object):
             f.close()
         except IOError, e:
             raise GitError("Make sure the Git repository '%s' is readable: %s"
-                           % (git_dir, unicode(e)))
+                           % (git_dir, to_unicode(e)))
 
         self.repo = GitCore(git_dir, git_bin=git_bin, log=log)
 
@@ -521,28 +528,35 @@ class Storage(object):
     #
 
     # called by Storage.sync()
-    def __rev_cache_sync(self, youngest_rev=None):
+    def __rev_cache_sync(self):
         """invalidates revision db cache if necessary"""
+
+        branches = self._get_branches()
 
         self.__rev_cache_lock.acquire()
         try:
             need_update = False
-            if self.__rev_cache:
-                last_youngest_rev = self.__rev_cache.youngest_rev
-                if last_youngest_rev != youngest_rev:
-                    self.logger.debug("invalidated caches (%s != %s)"
-                                      % (last_youngest_rev, youngest_rev))
-                    need_update = True
-            else:
+            if not self.__rev_cache:
                 need_update = True # almost NOOP
+            elif branches != self.__rev_cache.branch_dict:
+                self.logger.debug('invalidated caches for %d cause repository '
+                                  'has been changed', id(self))
+                need_update = True
 
             if need_update:
                 self.__rev_cache = None
-
             return need_update
 
         finally:
             self.__rev_cache_lock.release()
+
+    def invalidate_rev_cache(self):
+        self.__rev_cache_lock.acquire()
+        try:
+            self.__rev_cache = None
+        finally:
+            self.__rev_cache_lock.release()
+        self.logger.debug('invalidated caches for %d', id(self))
 
     def get_rev_cache(self):
         """Retrieve revision cache
@@ -1016,9 +1030,7 @@ class Storage(object):
         return self.get_commits().iterkeys()
 
     def sync(self):
-        rev = self.repo.rev_list('--max-count=1', '--topo-order', '--all') \
-                       .strip()
-        return self.__rev_cache_sync(rev)
+        return self.__rev_cache_sync()
 
     def get_historian(self, sha, base_path):
         return Historian(self, sha, base_path)
@@ -1043,10 +1055,12 @@ class Storage(object):
         return [rev.strip() for rev in tmp.splitlines()]
 
     def history_timerange(self, start, stop):
+        # retrieve start <= committer-time < stop,
+        # see CachedRepository.get_changesets()
         return [ rev.strip() for rev in \
-                     self.repo.rev_list('--reverse',
+                     self.repo.rev_list('--date-order',
                                         '--max-age=%d' % start,
-                                        '--min-age=%d' % stop,
+                                        '--min-age=%d' % (stop - 1),
                                         '--all').splitlines() ]
 
     def rev_is_anchestor_of(self, rev1, rev2):
