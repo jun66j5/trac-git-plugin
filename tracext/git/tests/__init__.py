@@ -13,12 +13,13 @@
 
 import unittest
 
-from tracext.git.tests import PyGIT
+from tracext.git.tests import PyGIT, git_fs
 
 
 def suite():
     suite = unittest.TestSuite()
     suite.addTest(PyGIT.suite())
+    suite.addTest(git_fs.suite())
     return suite
 
 
