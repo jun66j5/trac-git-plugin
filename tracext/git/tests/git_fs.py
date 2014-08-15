@@ -28,6 +28,7 @@ from trac.versioncontrol.web_ui.browser import BrowserModule
 from trac.versioncontrol.web_ui.log import LogModule
 from trac.web.href import Href
 
+from tracext.git.PyGIT import StorageFactory
 from tracext.git.git_fs import GitConnector
 from tracext.git.tests.compat import rmtree
 
@@ -52,6 +53,8 @@ class BaseTestCase(unittest.TestCase):
             self.env.config.set('git', 'git_bin', git_bin)
 
     def tearDown(self):
+        self._repomgr.reload_repositories()
+        StorageFactory._clean()
         self.env.reset_db()
         if os.path.isdir(self.repos_path):
             rmtree(self.repos_path)
