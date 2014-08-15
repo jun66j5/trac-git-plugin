@@ -15,21 +15,26 @@
 from datetime import datetime
 import itertools
 import os
-import sys
 
 from genshi.builder import tag
 
 from trac.cache import cached
 from trac.config import BoolOption, IntOption, PathOption, Option
-from trac.core import *
-from trac.util import TracError, shorten_line
+from trac.core import Component, TracError, implements
+from trac.util import shorten_line
 from trac.util.compat import any
-from trac.util.datefmt import FixedOffset, to_timestamp, format_datetime
+from trac.util.datefmt import FixedOffset, format_datetime, to_timestamp, \
+                              to_utimestamp
 from trac.util.text import to_unicode, exception_to_unicode
+from trac.util.translation import gettext as _gettext
 from trac.versioncontrol.api import Changeset, Node, Repository, \
                                     IRepositoryConnector, NoSuchChangeset, \
                                     NoSuchNode, IRepositoryProvider
-from trac.versioncontrol.cache import CachedRepository, CachedChangeset
+from trac.versioncontrol.cache import CACHE_METADATA_KEYS, \
+                                      CACHE_REPOSITORY_DIR, \
+                                      CACHE_YOUNGEST_REV, \
+                                      CachedRepository, CachedChangeset, \
+                                      _kindmap, _actionmap
 from trac.versioncontrol.web_ui import IPropertyRenderer
 from trac.web.chrome import Chrome
 from trac.wiki import IWikiSyntaxProvider
@@ -37,11 +42,16 @@ from trac.wiki import IWikiSyntaxProvider
 from tracext.git import PyGIT
 
 
-class GitCachedRepository(CachedRepository):
-    """Git-specific cached repository.
+def _invert_dict(d):
+    return dict(zip(d.values(), d.keys()))
 
-    Passes through {display,short,normalize}_rev
-    """
+
+_inverted_kindmap = _invert_dict(_kindmap)
+_inverted_actionmap = _invert_dict(_actionmap)
+
+
+class GitCachedRepository(CachedRepository):
+    """Git-specific cached repository."""
 
     def display_rev(self, rev):
         return self.short_rev(rev)
@@ -51,11 +61,21 @@ class GitCachedRepository(CachedRepository):
 
     def normalize_rev(self, rev):
         if not rev:
-            return self.repos.get_youngest_rev()
+            return self.get_youngest_rev()
         normrev = self.repos.git.verifyrev(rev)
         if normrev is None:
             raise NoSuchChangeset(rev)
         return normrev
+
+    def get_youngest_rev(self):
+        # return None if repository is empty
+        return CachedRepository.get_youngest_rev(self) or None
+
+    def parent_revs(self, rev):
+        return self.repos.parent_revs(rev)
+
+    def child_revs(self, rev):
+        return self.repos.child_revs(rev)
 
     def get_changesets(self, start, stop):
         for key, csets in itertools.groupby(
@@ -75,6 +95,180 @@ class GitCachedRepository(CachedRepository):
 
     def get_changeset(self, rev):
         return GitCachedChangeset(self, self.normalize_rev(rev), self.env)
+
+    def sync(self, feedback=None, clean=False):
+        if clean:
+            self.remove_cache()
+
+        db = self.env.get_read_db()
+        metadata = self.metadata
+        self.save_metadata(metadata)
+        meta_youngest = metadata.get(CACHE_YOUNGEST_REV)
+        repos = self.repos
+
+        def is_synced(rev):
+            cursor = db.cursor()
+            cursor.execute("SELECT COUNT(*) FROM revision "
+                           "WHERE repos=%s AND rev=%s",
+                           (self.id, rev))
+            row = cursor.fetchone()
+            return row and row[0] > 0
+
+        def traverse(rev, seen, revs=None):
+            if revs is None:
+                revs = []
+            while True:
+                if rev in seen:
+                    return revs
+                seen.add(rev)
+                if is_synced(rev):
+                    return revs
+                revs.append(rev)
+                parent_revs = repos.parent_revs(rev)
+                if not parent_revs:
+                    return revs
+                if len(parent_revs) == 1:
+                    rev = parent_revs[0]
+                    continue
+                idx = len(revs)
+                traverse(parent_revs.pop(), seen, revs)
+                for parent in parent_revs:
+                    revs[idx:idx] = traverse(parent, seen)
+
+        while True:
+            repos.sync()
+            repos_youngest = repos.youngest_rev
+            updated = False
+            seen = set()
+
+            for rev in repos.git.all_revs():
+                if repos.child_revs(rev):
+                    continue
+                revs = traverse(rev, seen)  # topology ordered
+                while revs:
+                    # sync revision from older revision to newer revision
+                    rev = revs.pop()
+                    self.log.info("Trying to sync revision [%s]", rev)
+                    cset = repos.get_changeset(rev)
+                    inserted = [False]
+                    @self.env.with_transaction()
+                    def insert_cset(db):
+                        cursor = db.cursor()
+                        try:
+                            self._insert_changeset(cursor, rev, cset)
+                            inserted[0] = True
+                        except Exception, e:
+                            if e.__class__.__name__ != 'IntegrityError':
+                                raise
+                            self.log.info('Revision %s already cached: %r',
+                                          rev, e)
+                            db.rollback()
+                    if not inserted[0]:
+                        continue
+                    updated = True
+                    if feedback:
+                        feedback(rev)
+
+            if updated:
+                continue  # sync again
+
+            if meta_youngest != repos_youngest:
+                @self.env.with_transaction()
+                def update_youngest(db):
+                    cursor = db.cursor()
+                    cursor.execute(
+                        "UPDATE repository SET value=%s "
+                        "WHERE id=%s AND name=%s",
+                        (repos_youngest, self.id, CACHE_YOUNGEST_REV))
+                    del self.metadata
+            return
+
+    def remove_cache(self):
+        self.log.info('Cleaning cache')
+        @self.env.with_transaction()
+        def do_clean(db):
+            cursor = db.cursor()
+            cursor.execute("DELETE FROM revision WHERE repos=%s",
+                           (self.id,))
+            cursor.execute("DELETE FROM node_change WHERE repos=%s",
+                           (self.id,))
+            cursor.executemany("""
+                DELETE FROM repository WHERE id=%s AND name=%s
+                """, [(self.id, k) for k in CACHE_METADATA_KEYS])
+            cursor.executemany("""
+                INSERT INTO repository (id,name,value) VALUES (%s,%s,%s)
+                """, [(self.id, k, '') for k in CACHE_METADATA_KEYS])
+            del self.metadata
+
+    def save_metadata(self, metadata):
+        @self.env.with_transaction()
+        def do_transaction(db):
+            cursor = db.cursor()
+            invalidate = False
+
+            # -- check that we're populating the cache for the correct
+            #    repository
+            repository_dir = metadata.get(CACHE_REPOSITORY_DIR)
+            if repository_dir:
+                # directory part of the repo name can vary on case insensitive
+                # fs
+                if os.path.normcase(repository_dir) \
+                        != os.path.normcase(self.name):
+                    self.log.info("'repository_dir' has changed from %r to %r",
+                                  repository_dir, self.name)
+                    raise TracError(_gettext(
+                        "The repository directory has changed, you should "
+                        "resynchronize the repository with: trac-admin $ENV "
+                        "repository resync '%(reponame)s'",
+                        reponame=self.reponame or '(default)'))
+            elif repository_dir is None:
+                self.log.info('Storing initial "repository_dir": %s',
+                              self.name)
+                cursor.execute("""
+                    INSERT INTO repository (id,name,value) VALUES (%s,%s,%s)
+                    """, (self.id, CACHE_REPOSITORY_DIR, self.name))
+                invalidate = True
+            else: # 'repository_dir' cleared by a resync
+                self.log.info('Resetting "repository_dir": %s', self.name)
+                cursor.execute("""
+                    UPDATE repository SET value=%s WHERE id=%s AND name=%s
+                    """, (self.name, self.id, CACHE_REPOSITORY_DIR))
+                invalidate = True
+
+            # -- insert a 'youngeset_rev' for the repository if necessary
+            if metadata.get(CACHE_YOUNGEST_REV) is None:
+                cursor.execute("""
+                    INSERT INTO repository (id,name,value) VALUES (%s,%s,%s)
+                    """, (self.id, CACHE_YOUNGEST_REV, ''))
+                invalidate = True
+
+            if invalidate:
+                del self.metadata
+
+    if not hasattr(CachedRepository, '_insert_changeset'):
+        def _insert_changeset(self, cursor, rev, cset):
+            srev = self.db_rev(rev)
+            # 1. Attempt to resync the 'revision' table.  In case of
+            # concurrent syncs, only such insert into the `revision` table
+            # will succeed, the others will fail and raise an exception.
+            cursor.execute("""
+                INSERT INTO revision (repos,rev,time,author,message)
+                VALUES (%s,%s,%s,%s,%s)
+                """, (self.id, srev, to_utimestamp(cset.date),
+                      cset.author, cset.message))
+            # 2. now *only* one process was able to get there (i.e. there
+            # *shouldn't* be any race condition here)
+            for path, kind, action, bpath, brev in cset.get_changes():
+                self.log.debug("Caching node change in [%s]: %r", rev,
+                               (path, kind, action, bpath, brev))
+                kind = _inverted_kindmap[kind]
+                action = _inverted_actionmap[action]
+                cursor.execute("""
+                    INSERT INTO node_change
+                        (repos,rev,path,node_type,change_type,base_path,
+                         base_rev)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s)
+                    """, (self.id, srev, path, kind, action, bpath, brev))
 
 
 class GitCachedChangeset(CachedChangeset):
@@ -557,11 +751,16 @@ class GitNode(Node):
         self.fs_sha = None # points to either tree or blobs
         self.fs_perm = None
         self.fs_size = None
-        rev = rev and str(rev) or 'HEAD'
+        if rev:
+            rev = repos.normalize_rev(to_unicode(rev))
+        else:
+            rev = repos.youngest_rev
 
         kind = Node.DIRECTORY
         p = path.strip('/')
-        if p: # ie. not the root-tree
+        if p:  # ie. not the root-tree
+            if not rev:
+                raise NoSuchNode(path, rev)
             if not ls_tree_info:
                 ls_tree_info = repos.git.ls_tree(rev, p) or None
                 if ls_tree_info:
@@ -620,8 +819,10 @@ class GitNode(Node):
                 self.repos.git.blame(self.rev,self.__git_path())]
 
     def get_entries(self):
+        if not self.rev:  # if empty repository
+            return iter([])
         if not self.isdir:
-            return
+            return iter([])
 
         historian = self.repos.git.get_historian(self.rev,
                                                  self.path.strip('/'))
@@ -651,6 +852,8 @@ class GitNode(Node):
         return self.fs_size
 
     def get_history(self, limit=None):
+        if not self.rev:  # if empty repository
+            return
         # TODO: find a way to follow renames/copies
         for is_last, rev in _last_iterable(self.repos.git.history(self.rev,
                                                 self.__git_path(), limit)):

@@ -331,12 +331,21 @@ class StorageFactory(object):
                              self.__repo))
         return self.__inst
 
+    @classmethod
+    def _clean(cls):
+        """For testing purpose only"""
+        StorageFactory.__dict_lock.acquire()
+        try:
+            cls.__dict.clear()
+            cls.__dict_nonweak.clear()
+        finally:
+            StorageFactory.__dict_lock.release()
+
 
 class Storage(object):
     """High-level wrapper around GitCore with in-memory caching"""
 
     __SREV_MIN = 4 # minimum short-rev length
-
 
     class RevCache(tuple):
         """RevCache(youngest_rev, oldest_rev, rev_dict, tag_set, srev_dict,
@@ -593,7 +602,7 @@ class Storage(object):
                                 for k, v in self._get_branches()]
                 head_revs = set(v for _, v in new_branches)
 
-                rev = ord_rev = 0
+                rev = ord_rev = None
                 for ord_rev, revs in enumerate(
                                         self.repo.rev_list('--parents',
                                                            '--topo-order',
