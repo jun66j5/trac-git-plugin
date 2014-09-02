@@ -600,7 +600,9 @@ class GitRepository(Repository):
                             "repository." % path)
 
         Repository.__init__(self, 'git:' + path, self.params, log)
-        self._cached_git_id = str(self.id)
+        self._cached_git_id = (self.__class__.__module__ + '.' +
+                               self.__class__.__name__ + '.cached_git:' +
+                               str(self.id))
 
     def close(self):
         self._git = None
